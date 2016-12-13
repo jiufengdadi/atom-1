@@ -1,4 +1,3 @@
-{find} = require 'underscore-plus'
 Grim = require 'grim'
 {Disposable} = require 'event-kit'
 _ = require 'underscore-plus'
@@ -14,6 +13,9 @@ AnyConstructor = Symbol('any-constructor')
 # simplest items is to separate the model and the view. The model handles
 # application logic and is the primary point of API interaction. The view
 # just handles presentation.
+#
+# Note: Models can be any object, but must implement a `getTitle()` function
+# if they are to be displayed in a {Pane}
 #
 # View providers inform the workspace how your model objects should be
 # presented in the DOM. A view provider must always return a DOM node, which

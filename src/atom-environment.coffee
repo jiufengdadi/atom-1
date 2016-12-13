@@ -9,11 +9,11 @@ fs = require 'fs-plus'
 {mapSourcePosition} = require 'source-map-support'
 Model = require './model'
 WindowEventHandler = require './window-event-handler'
-StylesElement = require './styles-element'
 StateStore = require './state-store'
 StorageFolder = require './storage-folder'
-{getWindowLoadSettings, setWindowLoadSettings} = require './window-load-settings-helpers'
+{getWindowLoadSettings} = require './window-load-settings-helpers'
 registerDefaultCommands = require './register-default-commands'
+{updateProcessEnv} = require './update-process-env'
 
 DeserializerManager = require './deserializer-manager'
 ViewRegistry = require './view-registry'
@@ -23,14 +23,16 @@ KeymapManager = require './keymap-extensions'
 TooltipManager = require './tooltip-manager'
 CommandRegistry = require './command-registry'
 GrammarRegistry = require './grammar-registry'
+{HistoryManager, HistoryProject} = require './history-manager'
+ReopenProjectMenuManager = require './reopen-project-menu-manager'
 StyleManager = require './style-manager'
 PackageManager = require './package-manager'
 ThemeManager = require './theme-manager'
 MenuManager = require './menu-manager'
 ContextMenuManager = require './context-menu-manager'
 CommandInstaller = require './command-installer'
-Clipboard = require './clipboard'
 Project = require './project'
+TitleBar = require './title-bar'
 Workspace = require './workspace'
 PanelContainer = require './panel-container'
 Panel = require './panel'
@@ -50,7 +52,6 @@ PanelElement = require './panel-element'
 PaneContainerElement = require './pane-container-element'
 PaneAxisElement = require './pane-axis-element'
 PaneElement = require './pane-element'
-TextEditorElement = require './text-editor-element'
 {createGutterView} = require './gutter-component-helpers'
 
 # Essential: Atom global for dealing with packages, themes, menus, and the window.
@@ -96,6 +97,9 @@ class AtomEnvironment extends Model
   # Public: A {GrammarRegistry} instance
   grammars: null
 
+  # Public: A {HistoryManager} instance
+  history: null
+
   # Public: A {PackageManager} instance
   packages: null
 
@@ -128,7 +132,7 @@ class AtomEnvironment extends Model
 
   # Call .loadOrCreate instead
   constructor: (params={}) ->
-    {@blobStore, @applicationDelegate, @window, @document, @configDirPath, @enablePersistence, onlyLoadBaseStyleSheets} = params
+    {@blobStore, @applicationDelegate, @window, @document, @clipboard, @configDirPath, @enablePersistence, onlyLoadBaseStyleSheets} = params
 
     @unloaded = false
     @loadTime = null
@@ -155,7 +159,7 @@ class AtomEnvironment extends Model
 
     @keymaps = new KeymapManager({@configDirPath, resourcePath, notificationManager: @notifications})
 
-    @tooltips = new TooltipManager(keymapManager: @keymaps)
+    @tooltips = new TooltipManager(keymapManager: @keymaps, viewRegistry: @views)
 
     @commands = new CommandRegistry
     @commands.attach(@window)
@@ -183,19 +187,23 @@ class AtomEnvironment extends Model
     @packages.setContextMenuManager(@contextMenu)
     @packages.setThemeManager(@themes)
 
-    @clipboard = new Clipboard()
-
     @project = new Project({notificationManager: @notifications, packageManager: @packages, @config, @applicationDelegate})
 
     @commandInstaller = new CommandInstaller(@getVersion(), @applicationDelegate)
 
+    @textEditors = new TextEditorRegistry({
+      @config, grammarRegistry: @grammars, assert: @assert.bind(this),
+      packageManager: @packages
+    })
+
     @workspace = new Workspace({
       @config, @project, packageManager: @packages, grammarRegistry: @grammars, deserializerManager: @deserializers,
-      notificationManager: @notifications, @applicationDelegate, @clipboard, viewRegistry: @views, assert: @assert.bind(this)
+      notificationManager: @notifications, @applicationDelegate, viewRegistry: @views, assert: @assert.bind(this),
+      textEditorRegistry: @textEditors,
     })
+
     @themes.workspace = @workspace
 
-    @textEditors = new TextEditorRegistry
     @autoUpdater = new AutoUpdateManager({@applicationDelegate})
 
     @config.load()
@@ -224,14 +232,13 @@ class AtomEnvironment extends Model
 
     @observeAutoHideMenuBar()
 
-    checkPortableHomeWritable = ->
-      responseChannel = "check-portable-home-writable-response"
-      ipcRenderer.on responseChannel, (event, response) ->
-        ipcRenderer.removeAllListeners(responseChannel)
-        atom.notifications.addWarning("#{response.message.replace(/([\\\.+\\-_#!])/g, '\\$1')}") if not response.writable
-      ipcRenderer.send('check-portable-home-writable', responseChannel)
+    @history = new HistoryManager({@project, @commands, localStorage})
+    # Keep instances of HistoryManager in sync
+    @history.onDidChangeProjects (e) =>
+      @applicationDelegate.didChangeHistoryManager() unless e.reloaded
+    @disposables.add @applicationDelegate.onDidChangeHistoryManager(=> @history.loadState())
 
-    checkPortableHomeWritable()
+    new ReopenProjectMenuManager({@menu, @commands, @history, @config, open: (paths) => @open(pathsToOpen: paths)})
 
   attachSaveStateListeners: ->
     saveState = _.debounce((=>
@@ -326,6 +333,8 @@ class AtomEnvironment extends Model
     @workspace.subscribeToEvents()
 
     @grammars.clear()
+
+    @textEditors.clear()
 
     @views.clear()
     @registerDefaultViewProviders()
@@ -535,6 +544,10 @@ class AtomEnvironment extends Model
   reload: ->
     @applicationDelegate.reloadWindow()
 
+  # Extended: Relaunch the entire application.
+  restartApplication: ->
+    @applicationDelegate.restartApplication()
+
   # Extended: Returns a {Boolean} that is `true` if the current window is maximized.
   isMaximized: ->
     @applicationDelegate.isWindowMaximized()
@@ -549,10 +562,6 @@ class AtomEnvironment extends Model
   # Extended: Set the full screen state of the current window.
   setFullScreen: (fullScreen=false) ->
     @applicationDelegate.setWindowFullScreen(fullScreen)
-    if fullScreen
-      @document.body.classList.add("fullscreen")
-    else
-      @document.body.classList.remove("fullscreen")
 
   # Extended: Toggle the full screen state of the current window.
   toggleFullScreen: ->
@@ -638,7 +647,7 @@ class AtomEnvironment extends Model
   restoreWindowDimensions: ->
     unless @windowDimensions? and @isValidDimensions(@windowDimensions)
       @windowDimensions = @getDefaultWindowDimensions()
-    @setWindowDimensions(@windowDimensions).then -> @windowDimensions
+    @setWindowDimensions(@windowDimensions).then => @windowDimensions
 
   restoreWindowBackground: ->
     if backgroundColor = window.localStorage.getItem('atom:window-background-color')
@@ -657,7 +666,11 @@ class AtomEnvironment extends Model
   # Call this method when establishing a real application window.
   startEditorWindow: ->
     @unloaded = false
-    @loadState().then (state) =>
+    updateProcessEnvPromise = updateProcessEnv(@getLoadSettings().env)
+    updateProcessEnvPromise.then =>
+      @packages.triggerActivationHook('core:loaded-shell-environment')
+
+    loadStatePromise = @loadState().then (state) =>
       @windowDimensions = state?.windowDimensions
       @displayWindow().then =>
         @commandInstaller.installAtomCommand false, (error) ->
@@ -668,6 +681,10 @@ class AtomEnvironment extends Model
         @disposables.add(@applicationDelegate.onDidOpenLocations(@openLocations.bind(this)))
         @disposables.add(@applicationDelegate.onApplicationMenuCommand(@dispatchApplicationMenuCommand.bind(this)))
         @disposables.add(@applicationDelegate.onContextMenuCommand(@dispatchContextMenuCommand.bind(this)))
+        @disposables.add @applicationDelegate.onSaveWindowStateRequest =>
+          callback = => @applicationDelegate.didSaveWindowState()
+          @saveState({isUnloading: true}).catch(callback).then(callback)
+
         @listenForUpdates()
 
         @registerDefaultTargetForKeymaps()
@@ -677,6 +694,9 @@ class AtomEnvironment extends Model
         startTime = Date.now()
         @deserialize(state) if state?
         @deserializeTimings.atom = Date.now() - startTime
+
+        if process.platform is 'darwin' and @config.get('core.useCustomTitleBar')
+          @workspace.addHeaderPanel({item: new TitleBar({@workspace, @themes, @applicationDelegate})})
 
         @document.body.appendChild(@views.getView(@workspace))
         @backgroundStylesheet?.remove()
@@ -691,6 +711,8 @@ class AtomEnvironment extends Model
 
         @openInitialEmptyEditorIfNecessary()
 
+    Promise.all([loadStatePromise, updateProcessEnvPromise])
+
   serialize: (options) ->
     version: @constructor.version
     project: @project.serialize(options)
@@ -699,11 +721,11 @@ class AtomEnvironment extends Model
     grammars: {grammarOverridesByPath: @grammars.grammarOverridesByPath}
     fullScreen: @isFullScreen()
     windowDimensions: @windowDimensions
+    textEditors: @textEditors.serialize()
 
   unloadEditorWindow: ->
     return if not @project
 
-    @saveState({isUnloading: true})
     @storeWindowBackground()
     @packages.deactivatePackages()
     @saveBlobStoreSync()
@@ -830,7 +852,7 @@ class AtomEnvironment extends Model
       @project.addPath(selectedPath) for selectedPath in selectedPaths
 
   showSaveDialog: (callback) ->
-    callback(showSaveDialogSync())
+    callback(@showSaveDialogSync())
 
   showSaveDialogSync: (options={}) ->
     @applicationDelegate.showSaveDialog(options)
@@ -841,18 +863,17 @@ class AtomEnvironment extends Model
     @blobStore.save()
 
   saveState: (options) ->
-    return Promise.resolve() unless @enablePersistence
-
     new Promise (resolve, reject) =>
-      return if not @project
-
-      state = @serialize(options)
-      savePromise =
-        if storageKey = @getStateKey(@project?.getPaths())
-          @stateStore.save(storageKey, state)
-        else
-          @applicationDelegate.setTemporaryWindowState(state)
-      savePromise.catch(reject).then(resolve)
+      if @enablePersistence and @project
+        state = @serialize(options)
+        savePromise =
+          if storageKey = @getStateKey(@project?.getPaths())
+            @stateStore.save(storageKey, state)
+          else
+            @applicationDelegate.setTemporaryWindowState(state)
+        savePromise.catch(reject).then(resolve)
+      else
+        resolve()
 
   loadState: ->
     if @enablePersistence
@@ -879,6 +900,8 @@ class AtomEnvironment extends Model
     startTime = Date.now()
     @project.deserialize(state.project, @deserializers) if state.project?
     @deserializeTimings.project = Date.now() - startTime
+
+    @textEditors.deserialize(state.textEditors) if state.textEditors
 
     startTime = Date.now()
     @workspace.deserialize(state.workspace, @deserializers) if state.workspace?

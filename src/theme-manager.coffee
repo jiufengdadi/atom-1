@@ -1,6 +1,6 @@
 path = require 'path'
 _ = require 'underscore-plus'
-{Emitter, Disposable, CompositeDisposable} = require 'event-kit'
+{Emitter, CompositeDisposable} = require 'event-kit'
 {File} = require 'pathwatcher'
 fs = require 'fs-plus'
 
@@ -170,7 +170,6 @@ class ThemeManager
     @userStyleSheetDisposable = @styleManager.addStyleSheet(userStylesheetContents, sourcePath: userStylesheetPath, priority: 2)
 
   loadBaseStylesheets: ->
-    @requireStylesheet('../static/bootstrap')
     @reloadBaseStylesheets()
 
   reloadBaseStylesheets: ->
@@ -179,7 +178,8 @@ class ThemeManager
       @requireStylesheet(nativeStylesheetPath)
 
   stylesheetElementForId: (id) ->
-    document.head.querySelector("atom-styles style[source-path=\"#{id}\"]")
+    escapedId = id.replace(/\\/g, '\\\\')
+    document.head.querySelector("atom-styles style[source-path=\"#{escapedId}\"]")
 
   resolveStylesheet: (stylesheetPath) ->
     if path.extname(stylesheetPath).length > 0
@@ -231,9 +231,6 @@ class ThemeManager
 
   applyStylesheet: (path, text) ->
     @styleSheetDisposablesBySourcePath[path] = @styleManager.addStyleSheet(text, sourcePath: path)
-
-  stringToId: (string) ->
-    string.replace(/\\/g, '/')
 
   activateThemes: ->
     new Promise (resolve) =>
